@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "MissAV Tab Exporter",
+  "version": "4.0.0",
+  "description": "播放时自动捕获 surrit m3u8/UUID 并上报本地下载工具",
+  "permissions": ["tabs", "webRequest"],
+  "host_permissions": [
+    "*://*.missav.ws/*",
+    "*://surrit.com/*",
+    "*://*.surrit.com/*",
+    "http://127.0.0.1:8766/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "MissAV 自动上报（点播放即可，无需导出）"
+  }
+}

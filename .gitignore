@@ -1,0 +1,35 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 本地脚本（不入库）
+organize_jav_files.py
+
+# 本地浏览器 / 密钥
+.browser_profile/
+.env
+missav.ws_cookies.txt
+
+# 运行产物 / 清单（本机状态，不入库）
+check_list1.json
+check_list1.txt
+check_list2.txt
+# v1 推送后取消下一行注释，check_list2.json 改回本机维护：
+# check_list2.json
+check_list.json
+check_list.txt
+downloaded_jav.txt
+out_test/
+out_test2/
+_probe_tmp/
+*.json.tmp
+*.txt.tmp
+
+# 系统杂项
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.log
