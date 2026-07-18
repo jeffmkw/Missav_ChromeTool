@@ -11,12 +11,16 @@
 
 ## 使用指南
 
-0. 前置：安装依赖 + ffmpeg（合并 mp4 用，需在 PATH 里能直接跑 `ffmpeg`）
-1. Chrome 扩展：`chrome://extensions` → 开开发者模式 → 「加载已解压的扩展程序」→ 选本仓库 `chrome_extension` 文件夹
-2. `python download_missav.py --collect`
-3. `python download_missav.py --download-only`
-- 可以添加参数 `python download_missav.py --download-only --parallel 4 --workers 20`，默认参数比较保守（见下文），但是这个4*12参数可以显著提升下载速度（但是可能会被反爬）。剩下的参数什么的问你的AI
-
+0. **前置**：安装依赖 + ffmpeg（合并 mp4 用，需在 PATH 里能直接跑 `ffmpeg`）
+1. **Chrome 扩展**：`chrome://extensions` → 开开发者模式 → 「加载已解压的扩展程序」→ 选本仓库 `chrome_extension` 文件夹
+2. **采集**
+   1. 准备好要下载的 tab，用 Chrome 统一打开之后，关掉所有页面
+   2. 终端执行：`python download_missav.py --collect`
+   3. 重新打开所有 tab（`Ctrl+Shift+T`）
+   4. 终端里应能看到各页面的嗅探结果；采完后按 Enter 结束采集
+   5. 如果没有嗅探到：先点一下播放；还不行请提交 issue，我看看是不是出了新格式
+3. **下载**：`python download_missav.py --download-only`
+### 关于参数的问题请去问你的 AI
 ---
 
 ## 我最后决定让AI写一个详细介绍
