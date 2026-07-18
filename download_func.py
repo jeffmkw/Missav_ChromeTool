@@ -72,7 +72,8 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
-QUALITIES = ("1080p", "720p", "480p")
+# 无扩展 m3u8 时的探测兜底（含 720p 与 1280x720 两种路径）
+QUALITIES = ("1080p", "1920x1080", "720p", "1280x720", "480p", "854x480")
 UUID_RE = re.compile(
     r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}"
 )

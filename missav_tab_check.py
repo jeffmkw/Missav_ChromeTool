@@ -2,11 +2,13 @@
 """
 Chrome Tab 检查模块（扩展自动上报 URL + UUID）
 
-扩展安装:
-  chrome://extensions → 开发者模式 → 加载 chrome_extension 文件夹
+终端执行指南
+------------
+扩展安装 / 更新后重载:
+  chrome://extensions → 开发者模式 → 加载或「重新加载」chrome_extension 文件夹
 
 主流程:
-  1. 采集（扩展监听 surrit m3u8，点播放即自动上报）:
+  1. 采集（扩展嗅探 surrit …/{uuid}/{任意清晰度}/video.m3u8，点播放即上报）:
      python download_missav.py --collect
      在 Chrome 逐个点播放；终端按 Enter 结束采集
 
@@ -69,12 +71,23 @@ def extract_code_from_url(url: str) -> str | None:
     slug = slug.replace("_", "-")
     return _extract_code(slug.upper()) or _extract_code(slug.replace("-", " ").upper())
 
+
+def normalize_code(code: str) -> str:
+    """番号归一化：去非字母数字，便于 SSIS-526 / SSIS526 互认。"""
+    return re.sub(r"[^A-Z0-9]", "", code.upper())
+
+
 EXTENSION_PORT = 8766
 EXTENSION_DIR = Path(__file__).resolve().parent / "chrome_extension"
 CHECK_LIST2_FILE = Path(__file__).resolve().parent / "check_list2.txt"
 CHECK_LIST2_JSON = Path(__file__).resolve().parent / "check_list2.json"
 CHECK_LIST1_FILE = Path(__file__).resolve().parent / "check_list1.txt"
 CHECK_LIST1_JSON = Path(__file__).resolve().parent / "check_list1.json"
+DOWNLOADED_JAV_FILE = Path(__file__).resolve().parent / "downloaded_jav.txt"
+DEFAULT_JAV_LIBRARY_DIR = Path(r"L:\JAV")
+VIDEO_EXTENSIONS = frozenset(
+    {".mp4", ".mkv", ".avi", ".wmv", ".mov", ".flv", ".ts", ".m4v"}
+)
 
 # 兼容旧文件名
 CHECK_LIST_FILE = CHECK_LIST2_FILE
@@ -89,6 +102,86 @@ CHECKLIST2_STATUSES = frozenset(
 CHECKLIST2_PROGRESS_STATUSES = frozenset(
     {"downloaded", "downloading", "download_done"}
 )
+
+
+def load_downloaded_jav(
+    path: Path | str = DOWNLOADED_JAV_FILE,
+) -> set[str]:
+    """读取已下载番号集合（归一化后）。"""
+    file_path = Path(path)
+    if not file_path.is_file():
+        return set()
+    codes: set[str] = set()
+    for line in file_path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        codes.add(normalize_code(text))
+    return codes
+
+
+def is_code_downloaded(code: str | None, downloaded: set[str]) -> bool:
+    if not code:
+        return False
+    return normalize_code(code) in downloaded
+
+
+def append_downloaded_jav(
+    code: str,
+    path: Path | str = DOWNLOADED_JAV_FILE,
+) -> bool:
+    """追加番号到名单（已存在则跳过）。返回是否真正写入。"""
+    cleaned = code.strip().upper()
+    if not cleaned:
+        return False
+    key = normalize_code(cleaned)
+    file_path = Path(path)
+    existing = load_downloaded_jav(file_path)
+    if key in existing:
+        return False
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with file_path.open("a", encoding="utf-8", newline="\n") as fh:
+        fh.write(cleaned + "\n")
+    return True
+
+
+def sync_downloaded_jav_from_dir(
+    jav_dir: Path | str = DEFAULT_JAV_LIBRARY_DIR,
+    path: Path | str = DOWNLOADED_JAV_FILE,
+) -> tuple[int, int, int]:
+    """
+    扫描本地片库目录，重写 downloaded_jav.txt。
+    返回 (写入番号数, 视频文件数, 未能抽番号的文件数)。
+    """
+    root = Path(jav_dir)
+    if not root.is_dir():
+        raise TabCheckError(f"片库目录不存在: {root}")
+
+    by_norm: dict[str, str] = {}
+    video_count = 0
+    no_code = 0
+    for file_path in root.rglob("*"):
+        if not file_path.is_file():
+            continue
+        if file_path.suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+        video_count += 1
+        code = _extract_code(file_path.name)
+        if not code:
+            no_code += 1
+            continue
+        key = normalize_code(code)
+        # 优先保留带连字符的写法
+        prev = by_norm.get(key)
+        if prev is None or ("-" in code and "-" not in prev):
+            by_norm[key] = code
+
+    codes = sorted(by_norm.values(), key=lambda c: (normalize_code(c), c))
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(codes) + ("\n" if codes else ""), encoding="utf-8")
+    return len(codes), video_count, no_code
+
 
 MISSAV_LANG = r"cn|en|ja|ko|ms|th|de|fr|vi|id|fil|pt"
 MISSAV_EXCLUDE_SLUGS = (
@@ -108,6 +201,21 @@ UUID_RE = re.compile(
     r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
     re.I,
 )
+
+
+def quality_rank(q: str | None) -> int:
+    """720p → 720；1280x720 → 用高度 720；无法解析 → 0。"""
+    s = str(q or "").strip().lower()
+    if not s:
+        return 0
+    m = re.search(r"(\d+)\s*p\b", s)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)\s*x\s*(\d+)", s)
+    if m:
+        return int(m.group(2))
+    digits = re.sub(r"\D", "", s)
+    return int(digits) if digits else 0
 
 
 class TabCheckError(Exception):
@@ -475,15 +583,32 @@ def load_check_items(
     ]
 
 
+def _short_text(text: str, width: int = 48) -> str:
+    text = " ".join(str(text or "").split())
+    if len(text) <= width:
+        return text
+    return text[: width - 1] + "…"
+
+
 def _merge_extension_items(
     tab_items: list[TabItem],
     *,
     by_url: dict[str, CheckList2Entry],
     output_path: Path,
+    downloaded: set[str] | None = None,
+    report_seq: list[int] | None = None,
 ) -> tuple[int, list[str]]:
     """把扩展上报条目合并进 by_url 并落盘；返回 (新增/更新数, 跳过 URL 列表)。"""
     skipped: list[str] = []
     added_or_updated = 0
+    status_touched = False
+    downloaded_set = downloaded if downloaded is not None else load_downloaded_jav()
+
+    def _next_seq() -> int:
+        if report_seq is None:
+            return 0
+        report_seq[0] += 1
+        return report_seq[0]
 
     for item in tab_items:
         if not item.video_uuid:
@@ -491,12 +616,30 @@ def _merge_extension_items(
         key = item.page_url.rstrip("/")
         code = extract_code_from_url(item.page_url)
         prev = by_url.get(key)
+        code_label = code or (prev.code if prev else None) or "?"
+        title_hint = _short_text(item.title or item.page_url)
+        quality_hint = item.quality or "?"
+
+        if is_code_downloaded(code, downloaded_set):
+            skipped.append(item.page_url)
+            seq = _next_seq()
+            prefix = f"#{seq} " if seq else ""
+            print(
+                f"  {prefix}[本地已有] {code_label}  跳过  | {title_hint}",
+                flush=True,
+            )
+            if prev and prev.status != "downloaded":
+                prev.status = "downloaded"
+                status_touched = True
+            continue
 
         if prev and prev.status in CHECKLIST2_PROGRESS_STATUSES:
             skipped.append(item.page_url)
+            seq = _next_seq()
+            prefix = f"#{seq} " if seq else ""
             print(
-                f"  跳过进行中/已完成 [{prev.status}] "
-                f"[{prev.code or code or '?'}]: {item.page_url}"
+                f"  {prefix}[清单已有] {code_label}  [{prev.status}]，跳过  | {title_hint}",
+                flush=True,
             )
             continue
         # 同 URL 已有更高清晰度则保留
@@ -509,13 +652,17 @@ def _merge_extension_items(
             and prev.quality
             and item.quality
         ):
-            try:
-                prev_q = int(str(prev.quality).rstrip("pP"))
-                new_q = int(str(item.quality).rstrip("pP"))
-                if prev_q >= new_q:
-                    continue
-            except ValueError:
-                pass
+            prev_q = quality_rank(prev.quality)
+            new_q = quality_rank(item.quality)
+            if prev_q and new_q and prev_q >= new_q:
+                seq = _next_seq()
+                prefix = f"#{seq} " if seq else ""
+                print(
+                    f"  {prefix}[清晰度忽略] {code_label}  {quality_hint} ≤ 现有 {prev.quality}"
+                    f"  | {title_hint}",
+                    flush=True,
+                )
+                continue
 
         entry = CheckList2Entry(
             page_url=item.page_url,
@@ -529,10 +676,17 @@ def _merge_extension_items(
         )
         by_url[key] = entry
         added_or_updated += 1
-        m3u8_hint = f"  m3u8={item.quality}" if item.m3u8_url else "  (下载时探测 m3u8)"
-        print(f"  OK [{entry.code or '?'}] {item.video_uuid}{m3u8_hint}", flush=True)
+        action = "更新" if prev else "新增"
+        seq = _next_seq()
+        prefix = f"#{seq} " if seq else ""
+        m3u8_hint = quality_hint if item.m3u8_url else "待探测"
+        print(
+            f"  {prefix}[{action}] {code_label}  → ready  ({m3u8_hint})"
+            f"  | {title_hint}",
+            flush=True,
+        )
 
-    if added_or_updated:
+    if added_or_updated or status_touched:
         kept_items = list(by_url.values())
         write_check_list2(kept_items, json_file=output_path)
         list1_entries = [
@@ -563,6 +717,9 @@ def collect_from_extension(
     by_url: dict[str, CheckList2Entry] = {
         entry.page_url.rstrip("/"): entry for entry in existing
     }
+    downloaded = load_downloaded_jav()
+    if downloaded:
+        print(f"已加载本地片库名单: {len(downloaded)} 个番号（将自动跳过）")
 
     state_lock = threading.Lock()
     stop_event = threading.Event()
@@ -571,6 +728,7 @@ def collect_from_extension(
     total_updated = 0
     all_skipped: list[str] = []
     session_ready = 0
+    report_seq = [0]
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
@@ -585,16 +743,28 @@ def collect_from_extension(
                 self.send_error(400)
                 return
             items = [i for i in _parse_post_body(body) if i.video_uuid]
-            with state_lock:
-                updated, skipped = _merge_extension_items(
-                    items,
-                    by_url=by_url,
-                    output_path=output_path,
-                )
-                total_updated += updated
-                all_skipped.extend(skipped)
-                session_ready = sum(
-                    1 for e in by_url.values() if e.status == "ready"
+            if not items:
+                print("  [!] 收到上报，但无有效 video_uuid，已忽略", flush=True)
+                updated, skipped = 0, []
+            else:
+                with state_lock:
+                    updated, skipped = _merge_extension_items(
+                        items,
+                        by_url=by_url,
+                        output_path=output_path,
+                        downloaded=downloaded,
+                        report_seq=report_seq,
+                    )
+                    total_updated += updated
+                    all_skipped.extend(skipped)
+                    session_ready = sum(
+                        1 for e in by_url.values() if e.status == "ready"
+                    )
+                print(
+                    f"  ── 本批 +{updated} / 跳过 {len(skipped)}"
+                    f"  │ 会话累计新增 {total_updated}"
+                    f"  │ 清单 ready={session_ready}",
+                    flush=True,
                 )
             last_activity.set()
             payload = json.dumps(
@@ -627,6 +797,9 @@ def collect_from_extension(
     print(f"本地服务: http://127.0.0.1:{port}/export")
     print(f"扩展目录: {EXTENSION_DIR}")
     print("采集中：在 Chrome 打开视频 Tab 并逐个点击播放（扩展自动上报）")
+    print(
+        "每条上报会即时打印：[新增]/[更新] / [本地已有] / [清单已有] / [清晰度忽略]"
+    )
     print("完成后在本终端按 Enter 结束采集（Ctrl+C 也可）")
     if timeout > 0:
         print(f"若连续 {int(timeout)} 秒无新上报将自动结束")
