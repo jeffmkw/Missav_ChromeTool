@@ -20,11 +20,13 @@
 4. 下载（独立，有空再跑）:
    python download_missav.py --download-only
    python download_missav.py --download-only --workers 20 --parallel 4
+   python download_missav.py --download-only --shutdown
    → 默认：视频并行 4，每视频分片线程 20
    → 状态: ready → downloading → download_done → downloaded
    → 重启优先: download_done(只合并) > downloading(续下) > ready
    → 已在 downloaded_jav.txt 的番号会跳过；下载成功会追加番号
    → 默认开启进度页（http://127.0.0.1:8777）；--no-web 可关闭
+   → --shutdown：本批正常结束后约 60 秒关机（取消: shutdown /a）
 
    快速测试（仅前 5 分片）: 加 --max-segments 5
 """
@@ -32,6 +34,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -643,6 +646,32 @@ def run_download_only(
     return results
 
 
+def request_system_shutdown(delay_seconds: int = 60) -> None:
+    """下载正常结束后请求关机；Windows 可用 shutdown /a 取消。"""
+    delay_seconds = max(0, int(delay_seconds))
+    if sys.platform == "win32":
+        print(
+            f"\n下载结束，{delay_seconds} 秒后关机"
+            "（取消请另开终端执行: shutdown /a）"
+        )
+        subprocess.run(
+            [
+                "shutdown",
+                "/s",
+                "/t",
+                str(delay_seconds),
+                "/c",
+                "MissAV download-only 完成，即将关机",
+            ],
+            check=False,
+        )
+        return
+
+    minutes = max(1, (delay_seconds + 59) // 60)
+    print(f"\n下载结束，约 {minutes} 分钟后关机（取消: shutdown -c）")
+    subprocess.run(["shutdown", "-h", f"+{minutes}"], check=False)
+
+
 def run_single_url(
     page_url: str,
     output_dir: Path,
@@ -783,6 +812,11 @@ def main() -> None:
         help="关闭本地下载进度页（默认开启，地址打印在「开始批量下载」下方）",
     )
     parser.add_argument(
+        "--shutdown",
+        action="store_true",
+        help="仅配合 --download-only：本批正常结束后约 60 秒关机（Windows 取消: shutdown /a）",
+    )
+    parser.add_argument(
         "--web-port",
         type=int,
         default=DEFAULT_WEB_PORT,
@@ -857,6 +891,8 @@ def main() -> None:
                 enable_web=not args.no_web,
                 web_port=args.web_port,
             )
+            if args.shutdown:
+                request_system_shutdown()
             return
 
         # 无参数时等同 --collect
