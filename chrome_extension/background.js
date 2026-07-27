@@ -3,8 +3,9 @@ const SERVER_BASE = "http://127.0.0.1:8766";
 const VIDEO_URL_RE =
   /^https?:\/\/(?:[\w-]+\.)*missav\.ws\/(?:[a-z0-9]+\/)?(?:cn|en|ja|ko|ms|th|de|fr|vi|id|fil|pt)\/(?!actresses(?:\/|$)|playlists(?:\/|$)|genres(?:\/|$)|makers(?:\/|$)|tags(?:\/|$)|search(?:\/|$)|new(?:\/|$)|release(?:\/|$)|vip(?:\/|$)|history(?:\/|$)|contact(?:\/|$)|terms(?:\/|$))[^\s?#]+\/?$/i;
 
+// 嗅探：UUID 后任意清晰度路径（720p / 1280x720 / …），不写死格式
 const SURRIT_M3U8_RE =
-  /https?:\/\/(?:[\w-]+\.)*surrit\.com\/([a-f0-9-]{36})\/([0-9]+p)\/video\.m3u8/i;
+  /https?:\/\/(?:[\w-]+\.)*surrit\.com\/([a-f0-9-]{36})\/([^/?#]+)\/video\.m3u8/i;
 
 /** tabId -> 最近一次捕获 */
 const byTab = new Map();
@@ -29,8 +30,14 @@ function parseM3u8(url) {
   };
 }
 
+/** 720p → 720；1280x720 → 用高度 720 */
 function qualityRank(q) {
-  const n = parseInt(String(q || "").replace(/\D/g, ""), 10);
+  const s = String(q || "").toLowerCase();
+  const p = s.match(/(\d+)\s*p\b/);
+  if (p) return parseInt(p[1], 10);
+  const wh = s.match(/(\d+)\s*x\s*(\d+)/);
+  if (wh) return parseInt(wh[2], 10);
+  const n = parseInt(s.replace(/\D/g, ""), 10);
   return Number.isFinite(n) ? n : 0;
 }
 
