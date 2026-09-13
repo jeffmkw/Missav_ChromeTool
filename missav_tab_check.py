@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
 from dataclasses import asdict, dataclass
@@ -84,7 +85,9 @@ CHECK_LIST2_JSON = Path(__file__).resolve().parent / "check_list2.json"
 CHECK_LIST1_FILE = Path(__file__).resolve().parent / "check_list1.txt"
 CHECK_LIST1_JSON = Path(__file__).resolve().parent / "check_list1.json"
 DOWNLOADED_JAV_FILE = Path(__file__).resolve().parent / "downloaded_jav.txt"
-DEFAULT_JAV_LIBRARY_DIR = Path(r"L:\JAV")
+UNKNOWN_JAV_FOLDER = "_UNKNOWN"
+# 与 organize_jav_files 一致：字母前缀 + (-|_) + 数字
+CODE_PREFIX_RE = re.compile(r"([A-Za-z]+)[-_]\d+")
 VIDEO_EXTENSIONS = frozenset(
     {".mp4", ".mkv", ".avi", ".wmv", ".mov", ".flv", ".ts", ".m4v"}
 )
@@ -102,6 +105,30 @@ CHECKLIST2_STATUSES = frozenset(
 CHECKLIST2_PROGRESS_STATUSES = frozenset(
     {"downloaded", "downloading", "download_done"}
 )
+
+
+def ensure_state_files() -> list[str]:
+    """
+    若本机清单 / 已下载名单不存在则创建空文件。
+    返回新创建的文件名列表。
+    """
+    created: list[str] = []
+    specs: list[tuple[Path, str]] = [
+        (CHECK_LIST2_JSON, "[]\n"),
+        (CHECK_LIST2_FILE, ""),
+        (CHECK_LIST1_JSON, "[]\n"),
+        (CHECK_LIST1_FILE, ""),
+        (_LEGACY_CHECK_LIST_JSON, "[]\n"),
+        (_LEGACY_CHECK_LIST_FILE, ""),
+        (DOWNLOADED_JAV_FILE, ""),
+    ]
+    for path, body in specs:
+        if path.is_file():
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        created.append(path.name)
+    return created
 
 
 def load_downloaded_jav(
@@ -146,7 +173,7 @@ def append_downloaded_jav(
 
 
 def sync_downloaded_jav_from_dir(
-    jav_dir: Path | str = DEFAULT_JAV_LIBRARY_DIR,
+    jav_dir: Path | str,
     path: Path | str = DOWNLOADED_JAV_FILE,
 ) -> tuple[int, int, int]:
     """
@@ -181,6 +208,50 @@ def sync_downloaded_jav_from_dir(
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(codes) + ("\n" if codes else ""), encoding="utf-8")
     return len(codes), video_count, no_code
+
+
+def extract_code_prefix(code: str) -> str:
+    """番号字母前缀，用于片库子目录（如 SSNI-126 → SSNI）。"""
+    match = CODE_PREFIX_RE.search(code.strip())
+    if match:
+        return match.group(1).upper()
+    return UNKNOWN_JAV_FOLDER
+
+
+def move_mp4_to_jav_library(
+    mp4_path: Path | str,
+    code: str,
+    jav_root: Path | str,
+) -> Path:
+    """
+    将合成后的 mp4 挪到片库 {jav_root}/{PREFIX}/。
+    目标同名已存在则先删除再移动。
+    """
+    src = Path(mp4_path)
+    if not src.is_file():
+        raise TabCheckError(f"待入库文件不存在: {src}")
+
+    root = Path(jav_root)
+    root.mkdir(parents=True, exist_ok=True)
+    prefix = extract_code_prefix(code)
+    dest_dir = root / prefix
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+
+    root_abs = root.resolve()
+    dest_abs = dest.resolve()
+    try:
+        dest_abs.relative_to(root_abs)
+    except ValueError as exc:
+        raise TabCheckError(f"安全拦截：入库目标不在片库内: {dest_abs}") from exc
+
+    if dest.exists():
+        if dest.is_dir():
+            raise TabCheckError(f"入库目标是目录，拒绝覆盖: {dest}")
+        dest.unlink()
+
+    shutil.move(str(src), str(dest))
+    return dest
 
 
 MISSAV_LANG = r"cn|en|ja|ko|ms|th|de|fr|vi|id|fil|pt"

@@ -1,4 +1,4 @@
-# Python
+﻿# Python
 .venv/
 __pycache__/
 *.py[cod]
@@ -8,23 +8,28 @@ __pycache__/
 # 本地脚本（不入库）
 organize_jav_files.py
 
-# 本地浏览器 / 密钥
+# 本地浏览器 / 密钥 / 本机配置
 .browser_profile/
 .env
 missav.ws_cookies.txt
 
+# 本机运维说明（含真实路径，勿提交）
+CLAUDE.md
+产品封装计划.md
+
 # 运行产物 / 清单（本机状态，不入库）
 check_list1.json
 check_list1.txt
+check_list2.json
 check_list2.txt
-# v1 推送后取消下一行注释，check_list2.json 改回本机维护：
-# check_list2.json
 check_list.json
 check_list.txt
 downloaded_jav.txt
 out_test/
 out_test2/
 _probe_tmp/
+nas_tmp/
+downloads/
 *.json.tmp
 *.txt.tmp
 

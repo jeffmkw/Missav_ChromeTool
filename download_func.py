@@ -5,12 +5,18 @@ MissAV 下载核心模块（供外部调用）
 终端执行指南
 ------------
 Cookie 默认自动加载同目录 missav.ws_cookies.txt（浏览器导出）。
-下载目录：项目根目录 .env 中 DOWNLOAD_DIR=...（未配置则默认 D:\downloads）。
+本机路径一律写在项目根 .env（见 .env.example）：
+  DOWNLOAD_DIR=...
+  JAV_LIBRARY_DIR=...
+未配置 DOWNLOAD_DIR 时回退到项目内 downloads/；JAV_LIBRARY_DIR 未配置则会报错。
+
 单 URL 全自动下载为 mp4（默认下载全量）:
     python download_missav.py --url "https://missav.ws/en/gmem-152-uncensored-leak"
 
 快速测试前 5 分片:
     python download_missav.py --url "https://missav.ws/en/gmem-152-uncensored-leak" --max-segments 5
+
+NAS 宿主机：download_missav_nas.py（默认 Python HTTP，绕过 NAS 上 curl 被 CF 拦）。
 
 示例:
     from download_func import download_url
@@ -26,14 +32,37 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
+from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
-_ENV_FILE = Path(__file__).resolve().parent / ".env"
-DEFAULT_DOWNLOAD_DIR = Path(r"D:\downloads")
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_ENV_FILE = _PROJECT_ROOT / ".env"
+_ENV_EXAMPLE = _PROJECT_ROOT / ".env.example"
+DEFAULT_DOWNLOAD_DIR = _PROJECT_ROOT / "downloads"
+
+
+def ensure_env_file() -> bool:
+    """若无 .env，从 .env.example 复制一份待填模板。返回是否新创建。"""
+    if _ENV_FILE.is_file():
+        return False
+    if _ENV_EXAMPLE.is_file():
+        shutil.copyfile(_ENV_EXAMPLE, _ENV_FILE)
+    else:
+        _ENV_FILE.write_text(
+            "# 请填写本机路径后重新运行\n"
+            "DOWNLOAD_DIR=\n"
+            "JAV_LIBRARY_DIR=\n"
+            "NAS_DOWNLOAD_DIR=\n"
+            "NAS_JAV_LIBRARY_DIR=\n",
+            encoding="utf-8",
+        )
+    return True
 
 
 def _read_env_file() -> dict[str, str]:
@@ -55,7 +84,7 @@ def _read_env_file() -> dict[str, str]:
 
 
 def resolve_download_dir() -> Path:
-    """下载目录：环境变量 DOWNLOAD_DIR > .env > D:\\downloads。"""
+    """下载目录：环境变量 DOWNLOAD_DIR > .env > 项目内 downloads/。"""
     env_val = os.environ.get("DOWNLOAD_DIR", "").strip()
     if env_val:
         return Path(env_val)
@@ -65,9 +94,31 @@ def resolve_download_dir() -> Path:
     return DEFAULT_DOWNLOAD_DIR
 
 
+def bootstrap_workspace() -> list[str]:
+    """
+    确保 .env 与本机清单文件存在。
+    返回需要打印给用户的提示（新创建时）。
+    """
+    messages: list[str] = []
+    if ensure_env_file():
+        messages.append(
+            f"已创建 {_ENV_FILE.name}（由 .env.example 生成），"
+            "请填写 DOWNLOAD_DIR / JAV_LIBRARY_DIR 等后重新运行。"
+        )
+    # 延迟导入，避免与 missav_tab_check 循环依赖
+    from missav_tab_check import ensure_state_files
+
+    created = ensure_state_files()
+    if created:
+        messages.append("已创建本机状态文件: " + ", ".join(created))
+    return messages
+
+
+# 模块加载前尽量备好 .env，便于下方 resolve
+ensure_env_file()
 DOWNLOAD_DIR = resolve_download_dir()
 TEST_MAX_SEGMENTS = 5
-DEFAULT_COOKIE_FILE = Path(__file__).resolve().parent / "missav.ws_cookies.txt"
+DEFAULT_COOKIE_FILE = _PROJECT_ROOT / "missav.ws_cookies.txt"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -82,15 +133,17 @@ SURRIT_UUID_RE = re.compile(r"surrit\.com/([a-f0-9-]{36})/")
 ProgressCallback = Callable[[int, int], None]
 PhaseCallback = Callable[[str], None]
 
-# Windows 上使用 curl.exe（本项目仅在 PC 端运行）
+# Windows 上使用 curl.exe；NAS 可用 set_http_backend("python")
 CURL_BIN = "curl.exe" if sys.platform == "win32" else "curl"
 SEGMENT_MAX_TIME_S = 120
 SEGMENT_MAX_RETRIES = 3
 PROBE_MAX_TIME_S = 8
 DEFAULT_SEGMENT_WORKERS = 4
+HttpBackend = Literal["curl", "python"]
 
 # None = 不使用；False = 自动（默认文件存在则加载）；Path = 指定文件
 _cookie_file: Path | None | Literal[False] = False
+_http_backend: HttpBackend = "curl"
 
 
 def set_cookie_file(path: Path | str | None | Literal[False] = False) -> None:
@@ -102,6 +155,18 @@ def set_cookie_file(path: Path | str | None | Literal[False] = False) -> None:
         _cookie_file = None
     else:
         _cookie_file = Path(path)
+
+
+def set_http_backend(backend: HttpBackend) -> None:
+    """curl=系统 curl（本机默认）；python=urllib（NAS 推荐，TLS 指纹不同）。"""
+    global _http_backend
+    if backend not in ("curl", "python"):
+        raise DownloadError(f"未知 HTTP 后端: {backend}")
+    _http_backend = backend
+
+
+def get_http_backend() -> HttpBackend:
+    return _http_backend
 
 
 def resolve_cookie_file() -> Path | None:
@@ -139,6 +204,25 @@ class DownloadResult:
 
 class DownloadError(Exception):
     """下载流程中的业务错误。"""
+
+
+def _env_lookup(key: str) -> str:
+    env_val = os.environ.get(key, "").strip()
+    if env_val:
+        return env_val
+    return _read_env_file().get(key, "").strip()
+
+
+def resolve_jav_library_dir() -> Path:
+    """片库目录：环境变量或 .env 的 JAV_LIBRARY_DIR（必填）。"""
+    val = _env_lookup("JAV_LIBRARY_DIR")
+    if val:
+        return Path(val)
+    raise DownloadError(
+        "未配置 JAV_LIBRARY_DIR。\n"
+        "请在环境变量或项目根 .env 中设置，例如:\n"
+        "  JAV_LIBRARY_DIR=你的片库路径"
+    )
 
 
 def sanitize_title(title: str, max_len: int = 200) -> str:
@@ -260,12 +344,113 @@ def fetch_page(page_url: str) -> tuple[str, str, str]:
     return title, video_uuid, html
 
 
+def _looks_like_html(data: bytes) -> bool:
+    head = data.lstrip()[:32].lower()
+    return head.startswith(b"<!doctype") or head.startswith(b"<html")
+
+
+def _is_cloudflare_bytes(data: bytes) -> bool:
+    """识别 CF 拦截页；勿用 challenge-platform（成功页也可能出现）。"""
+    lower = data[:4000].lower()
+    return (
+        b"attention required" in lower
+        or b"just a moment" in lower
+        or b"cf-browser-verification" in lower
+        or b"cf_chl_" in lower
+        or (b"cloudflare" in lower and b"challenge" in lower)
+    )
+
+
+def _python_cdn_headers(referer: str) -> dict[str, str]:
+    origin = referer.rstrip("/") or "https://missav.ws"
+    return {
+        "User-Agent": USER_AGENT,
+        "Referer": referer,
+        "Origin": origin,
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+
+
+def _python_urlopen(url: str, referer: str, *, timeout: int):
+    req = Request(url, headers=_python_cdn_headers(referer))
+    try:
+        return urlopen(req, timeout=timeout)
+    except HTTPError as exc:
+        raise DownloadError(f"HTTP {exc.code}: {url}") from exc
+    except URLError as exc:
+        raise DownloadError(f"请求失败: {exc.reason}") from exc
+
+
+def _python_fetch(url: str, referer: str, *, timeout: int) -> bytes:
+    with _python_urlopen(url, referer, timeout=timeout) as resp:
+        data = resp.read()
+    if _looks_like_html(data) or _is_cloudflare_bytes(data):
+        raise DownloadError("CDN 返回 HTML（可能被 Cloudflare 拦截）")
+    return data
+
+
+def _python_probe(url: str, referer: str) -> bool:
+    """HEAD 在 CF 下不可靠；短超时 GET 只读前缀，避免拉完整播放列表。"""
+    try:
+        with _python_urlopen(url, referer, timeout=PROBE_MAX_TIME_S) as resp:
+            head = resp.read(512)
+        if not head or _looks_like_html(head) or _is_cloudflare_bytes(head):
+            return False
+        return b"#EXTM3U" in head
+    except DownloadError:
+        return False
+
+
+def _python_download(url: str, referer: str, dest: Path) -> None:
+    """流式写盘，减少大分片内存占用；失败退避重试。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 0:
+        return
+
+    # 先写 .part 再原子改名：进程被 kill/断电时不会留下半截 .ts 被续传误判为已完成
+    last_err = ""
+    part = dest.with_name(dest.name + ".part")
+    for attempt in range(1, SEGMENT_MAX_RETRIES + 1):
+        if part.exists():
+            part.unlink()
+        try:
+            with _python_urlopen(url, referer, timeout=SEGMENT_MAX_TIME_S) as resp:
+                first = resp.read(4096)
+                if not first:
+                    last_err = f"空响应: {url}"
+                elif _looks_like_html(first) or _is_cloudflare_bytes(first):
+                    raise DownloadError("CDN 返回 HTML（可能被 Cloudflare 拦截）")
+                else:
+                    with part.open("wb") as out:
+                        out.write(first)
+                        while True:
+                            chunk = resp.read(64 * 1024)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                    if part.exists() and part.stat().st_size > 0:
+                        os.replace(part, dest)
+                        return
+                    last_err = f"写入后文件为空: {url}"
+        except DownloadError as exc:
+            last_err = str(exc)
+        if part.exists():
+            part.unlink()
+        if attempt < SEGMENT_MAX_RETRIES:
+            time.sleep(min(attempt * 1.5, 5.0))
+    raise DownloadError(last_err or f"下载失败: {url}")
+
+
 def curl_fetch(url: str, referer: str) -> bytes:
+    if _http_backend == "python":
+        return _python_fetch(url, referer, timeout=30)
+
     cmd = [*curl_base_args(), *curl_cookie_args(), *curl_headers(referer), url]
     result = subprocess.run(cmd, capture_output=True, check=False)
     if result.returncode != 0:
         raise DownloadError(result.stderr.decode("utf-8", errors="replace") or "curl 失败")
-    if result.stdout[:15].startswith(b"<!DOCTYPE") or result.stdout[:5].startswith(b"<html"):
+    if _looks_like_html(result.stdout):
         raise DownloadError("CDN 返回 HTML（可能被 Cloudflare 拦截）")
     return result.stdout
 
@@ -382,6 +567,9 @@ def probe_m3u8(video_uuid: str, page_url: str, html: str | None = None) -> tuple
 
 
 def curl_probe(url: str, referer: str) -> bool:
+    if _http_backend == "python":
+        return _python_probe(url, referer)
+
     cmd = [
         _ensure_curl(),
         "-sI",
@@ -398,28 +586,35 @@ def curl_probe(url: str, referer: str) -> bool:
 
 
 def curl_download(url: str, referer: str, dest: Path) -> None:
+    if _http_backend == "python":
+        _python_download(url, referer, dest)
+        return
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
         return
 
+    # 先下 .part 再原子改名：中断不会留下半截 .ts 被续传误判为已完成
     last_err = ""
+    part = dest.with_name(dest.name + ".part")
     for attempt in range(1, SEGMENT_MAX_RETRIES + 1):
-        if dest.exists():
-            dest.unlink()
+        if part.exists():
+            part.unlink()
         cmd = [
             *curl_segment_args(),
             *curl_cookie_args(),
             *curl_headers(referer),
             "-o",
-            str(dest),
+            str(part),
             url,
         ]
         result = subprocess.run(cmd, capture_output=True, check=False)
-        if result.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+        if result.returncode == 0 and part.exists() and part.stat().st_size > 0:
+            os.replace(part, dest)
             return
         last_err = result.stderr.decode("utf-8", errors="replace") or f"下载失败: {url}"
-        if dest.exists():
-            dest.unlink()
+        if part.exists():
+            part.unlink()
 
     raise DownloadError(last_err)
 
@@ -674,7 +869,7 @@ def download(
 
     Args:
         page_url: missav 页面 URL
-        output_dir: 下载根目录，默认见 .env 的 DOWNLOAD_DIR 或用户 Downloads
+        output_dir: 下载根目录，默认见 .env 的 DOWNLOAD_DIR 或项目内 downloads/
         max_segments: 最多下载分片数，None 表示全部
         workers: 分片并发数
         on_progress: 进度回调 (done, total)

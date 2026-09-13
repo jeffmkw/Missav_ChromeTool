@@ -2,10 +2,14 @@
 """
 终端执行指南
 ------------
-由 download_missav.py --download-only 启动（默认开启进度页；--no-web 关闭）。
+由 download_missav.py / download_missav_nas.py --download-only 启动
+（默认开启进度页；--no-web 关闭）。
 
-本模块提供本地下载进度页（只读）:
+本机默认只监听 127.0.0.1:
   http://127.0.0.1:8777
+
+NAS 默认监听 0.0.0.0（局域网可访问）:
+  http://<NAS_IP>:8777
 """
 
 from __future__ import annotations
@@ -565,8 +569,23 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
 
+def format_progress_url(host: str, port: int) -> str:
+    """绑定地址转可访问提示；0.0.0.0 时提示改用局域网 IP。"""
+    if host in ("0.0.0.0", "::", "[::]"):
+        return (
+            f"http://0.0.0.0:{port}"
+            f"（局域网请用 NAS IP，如 http://<NAS_IP>:{port}）"
+        )
+    return f"http://{host}:{port}"
+
+
 class ProgressWebServer:
-    def __init__(self, store: ProgressStore, host: str = "127.0.0.1", port: int = DEFAULT_WEB_PORT):
+    def __init__(
+        self,
+        store: ProgressStore,
+        host: str = "127.0.0.1",
+        port: int = DEFAULT_WEB_PORT,
+    ):
         self.store = store
         self.host = host
         self.port = port
@@ -575,7 +594,7 @@ class ProgressWebServer:
 
     @property
     def url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return format_progress_url(self.host, self.port)
 
     def start(self) -> str:
         last_err: Exception | None = None

@@ -5,11 +5,15 @@
 1. 安装依赖（首次）:
    pip install -r requirements.txt
 
-2. 同步本地片库名单（可选，从 L:\\JAV 扫描番号）:
-   python download_missav.py --sync-downloaded
-   python download_missav.py --sync-downloaded L:\\JAV
+2. 配置项目根 .env（无则首次运行会从 .env.example 自动生成）:
+   DOWNLOAD_DIR=本机临时下载目录
+   JAV_LIBRARY_DIR=本机成片入库目录
 
-3. 采集（扩展自动上报，无需点导出）:
+3. 同步片库名单（可选）:
+   python download_missav.py --sync-downloaded
+   python download_missav.py --sync-downloaded "你的片库路径"
+
+4. 采集（仅本机；扩展自动上报，无需点导出）:
    python download_missav.py --collect
    → Chrome 打开视频 Tab，逐个点击播放
    → 扩展嗅探 surrit …/{uuid}/{任意清晰度}/video.m3u8 后写入 check_list2.json
@@ -17,23 +21,24 @@
    → 番号已在 downloaded_jav.txt 中的会自动跳过
    → 终端按 Enter 结束采集
 
-4. 下载（独立，有空再跑）:
+5. 本机下载（临时目录 DOWNLOAD_DIR；成片自动入库 JAV_LIBRARY_DIR）:
    python download_missav.py --download-only
    python download_missav.py --download-only --workers 20 --parallel 4
    python download_missav.py --download-only --shutdown
-   → 默认：视频并行 4，每视频分片线程 20
-   → 状态: ready → downloading → download_done → downloaded
-   → 重启优先: download_done(只合并) > downloading(续下) > ready
-   → 已在 downloaded_jav.txt 的番号会跳过；下载成功会追加番号
+   → 路径见 .env；开始前扫描片库，已有番号跳过
+   → 全量合成成功后挪到 {JAV_LIBRARY_DIR}/{PREFIX}/
+   → --max-segments 测试：不入库、不登记
    → 默认开启进度页（http://127.0.0.1:8777）；--no-web 可关闭
-   → --shutdown：本批正常结束后约 60 秒关机（取消: shutdown /a）
 
-   快速测试（仅前 5 分片）: 加 --max-segments 5
+6. NAS 宿主机下载（Python urllib 拉 CDN；采集仍用上面 --collect）:
+   python3 download_missav_nas.py --download-only --no-web
+   python3 download_missav_nas.py --download-only --max-segments 5 --no-web
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 import threading
@@ -55,10 +60,12 @@ from download_func import (
     DOWNLOAD_DIR,
     DownloadError,
     DownloadResult,
+    bootstrap_workspace,
     download,
     download_from_tab,
     download_url,
     merge_hls_to_mp4,
+    resolve_jav_library_dir,
     segments_task_dir,
 )
 from download_progress_web import (
@@ -68,7 +75,6 @@ from download_progress_web import (
 )
 from missav_tab_check import (
     CHECK_LIST2_JSON,
-    DEFAULT_JAV_LIBRARY_DIR,
     DOWNLOADED_JAV_FILE,
     EXTENSION_DIR,
     CheckList2Entry,
@@ -80,6 +86,7 @@ from missav_tab_check import (
     is_code_downloaded,
     load_check_list2,
     load_downloaded_jav,
+    move_mp4_to_jav_library,
     normalize_code,
     save_check_list2,
     sync_downloaded_jav_from_dir,
@@ -448,6 +455,7 @@ def run_parallel(
     keep_segments: bool = False,
     enable_web: bool = True,
     web_port: int = DEFAULT_WEB_PORT,
+    web_host: str = "127.0.0.1",
 ) -> list[DownloadResult]:
     store: ProgressStore | None = None
     web: ProgressWebServer | None = None
@@ -455,7 +463,7 @@ def run_parallel(
     errors: list[tuple[str, Exception]] = []
     if enable_web:
         store = ProgressStore()
-        web = ProgressWebServer(store, port=web_port)
+        web = ProgressWebServer(store, host=web_host, port=web_port)
         print(f"进度页: {web.start()}")
 
     try:
@@ -496,11 +504,26 @@ def run_download_only(
     keep_segments: bool = False,
     enable_web: bool = True,
     web_port: int = DEFAULT_WEB_PORT,
+    web_host: str = "127.0.0.1",
+    jav_library_dir: Path | None = None,
 ) -> list[DownloadResult]:
     merge_only_entries: list[CheckList2Entry] = []
     download_entries: list[CheckList2Entry] = []
     demoted = 0
     skipped_library = 0
+
+    if jav_library_dir is not None:
+        if not jav_library_dir.is_dir():
+            raise DownloadError(f"片库目录不存在: {jav_library_dir}")
+        codes_n, videos_n, no_code_n = sync_downloaded_jav_from_dir(
+            jav_library_dir,
+            DOWNLOADED_JAV_FILE,
+        )
+        print(
+            f"片库已扫描: {codes_n} 个番号"
+            f"（视频 {videos_n}，未能抽番号 {no_code_n}）→ {DOWNLOADED_JAV_FILE.name}"
+        )
+
     downloaded_codes = load_downloaded_jav()
 
     for entry in entries:
@@ -526,23 +549,25 @@ def run_download_only(
                 download_entries.append(entry)
         elif entry.status == "downloading":
             download_entries.append(entry)
-        elif entry.status == "ready":
+        elif entry.status in ("ready", "failed"):
+            # failed 也重试：上次失败不意味着永久失败（如 CDN 临时抽风）
             download_entries.append(entry)
 
-    # downloading 优先于 ready
-    download_entries.sort(key=lambda e: 0 if e.status == "downloading" else 1)
+    # downloading 优先于 ready，failed 最后
+    _order = {"downloading": 0, "ready": 1, "failed": 2}
+    download_entries.sort(key=lambda e: _order.get(e.status, 3))
 
     if skipped_library or demoted:
         save_check_list2(entries)
     if skipped_library:
-        print(f"本地片库已有，跳过 {skipped_library} 条（已标为 downloaded）")
+        print(f"片库已有，跳过 {skipped_library} 条（已标为 downloaded）")
     if demoted:
         print(f"有 {demoted} 条 download_done 缺少分片，已退回 ready 重新下载")
 
     if not merge_only_entries and not download_entries:
         raise DownloadError(
             "checklist2 中没有可处理条目"
-            "（需要 ready / downloading / download_done 且含 video_uuid）\n"
+            "（需要 ready / downloading / download_done / failed 且含 video_uuid）\n"
             "请先运行 --collect，在 Chrome 逐个点播放（扩展自动上报）"
         )
 
@@ -565,10 +590,12 @@ def run_download_only(
     errors: list[tuple[str, Exception]] = []
     if enable_web:
         store = ProgressStore()
-        web = ProgressWebServer(store, port=web_port)
+        web = ProgressWebServer(store, host=web_host, port=web_port)
         print(f"进度页: {web.start()}")
 
     print(f"输出目录: {output_dir}")
+    if jav_library_dir is not None:
+        print(f"片库目录: {jav_library_dir}")
     print("优先级: download_done(只合并) > downloading(续下) > ready")
 
     def persist_checklist() -> None:
@@ -587,27 +614,47 @@ def run_download_only(
             entry.status = "download_done"
             persist_checklist()
 
-    def on_success(item: TabItem, _result: DownloadResult) -> None:
+    def on_success(item: TabItem, result: DownloadResult) -> None:
         entry = all_by_url.get(item.page_url.rstrip("/"))
-        if entry:
-            entry.status = "downloaded"
-            code = entry.code or extract_code_from_url(entry.page_url)
-            if code:
-                entry.code = code
-                append_downloaded_jav(code)
-                downloaded_codes.add(normalize_code(code))
+        if not entry:
+            return
+        code = entry.code or extract_code_from_url(entry.page_url)
+        if code:
+            entry.code = code
+
+        # 限分片测试：不入库、不登记
+        if max_segments is not None:
+            entry.status = "ready"
             persist_checklist()
+            print(f"  [测试] 限分片，未入库未登记: {result.mp4_path or result.task_dir}")
+            return
+
+        if result.mp4_path and code and jav_library_dir is not None:
+            final_path = move_mp4_to_jav_library(
+                result.mp4_path,
+                code,
+                jav_library_dir,
+            )
+            result.mp4_path = final_path
+            print(f"  [入库] {code} → {final_path}")
+
+        entry.status = "downloaded"
+        if code:
+            append_downloaded_jav(code)
+            downloaded_codes.add(normalize_code(code))
+        persist_checklist()
 
     def on_failure(item: TabItem, exc: Exception) -> None:
         entry = all_by_url.get(item.page_url.rstrip("/"))
         if not entry:
             return
         msg = str(exc)
-        if entry.status == "download_done" and "缺少分片" in msg:
+        if entry.status == "download_done":
+            # 合并失败：缓存分片可能已损坏（如上次中断留下半截 .ts），删掉重下，
+            # 避免下次运行又走"只合并"反复失败
+            title = entry.title or entry.page_url
+            shutil.rmtree(segments_task_dir(output_dir, title), ignore_errors=True)
             entry.status = "ready"
-        elif entry.status == "download_done":
-            # 合并失败：保留 download_done，下次只合并
-            pass
         else:
             entry.status = "failed"
         persist_checklist()
@@ -760,8 +807,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--output",
-        default=str(DOWNLOAD_DIR),
-        help=f"下载根目录（默认 {DOWNLOAD_DIR}）",
+        default=None,
+        help="下载临时根目录（默认 .env 的 DOWNLOAD_DIR）",
     )
     parser.add_argument(
         "--max-segments",
@@ -823,24 +870,42 @@ def main() -> None:
         help=f"进度页端口（默认 {DEFAULT_WEB_PORT}）",
     )
     parser.add_argument(
+        "--web-host",
+        default="127.0.0.1",
+        help="进度页监听地址（默认 127.0.0.1；局域网访问可设 0.0.0.0）",
+    )
+    parser.add_argument(
         "--sync-downloaded",
         nargs="?",
-        const=str(DEFAULT_JAV_LIBRARY_DIR),
+        const="",
         default=None,
         metavar="DIR",
-        help=f"扫描本地片库目录写入 {DOWNLOADED_JAV_FILE.name}（默认 {DEFAULT_JAV_LIBRARY_DIR}）",
+        help=(
+            f"扫描片库目录写入 {DOWNLOADED_JAV_FILE.name}"
+            "（默认读取 .env 的 JAV_LIBRARY_DIR）"
+        ),
+    )
+    parser.add_argument(
+        "--no-shelve",
+        action="store_true",
+        help="下载完成后不自动入库片库（默认会挪到 JAV_LIBRARY_DIR/{PREFIX}/）",
     )
     args = parser.parse_args()
 
+    for msg in bootstrap_workspace():
+        print(msg)
+
     check_list_path = Path(args.check_list)
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
     max_segments = None if args.full or args.max_segments is None else args.max_segments
 
     try:
         if args.sync_downloaded is not None:
+            if args.sync_downloaded:
+                sync_dir = Path(args.sync_downloaded)
+            else:
+                sync_dir = resolve_jav_library_dir()
             codes_n, videos_n, no_code_n = sync_downloaded_jav_from_dir(
-                args.sync_downloaded,
+                sync_dir,
                 DOWNLOADED_JAV_FILE,
             )
             print(
@@ -848,6 +913,13 @@ def main() -> None:
                 f"（视频 {videos_n}，未能抽番号 {no_code_n}）"
             )
             return
+
+        # 仅下载入库时需要片库路径；纯采集不强制
+        need_library = bool(args.download_only or args.url) and not args.no_shelve
+        jav_library_dir = resolve_jav_library_dir() if need_library else None
+
+        output_dir = Path(args.output) if args.output else DOWNLOAD_DIR
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         if args.collect:
             print("采集：等待扩展自动上报（点播放即可）…")
@@ -870,6 +942,20 @@ def main() -> None:
                 title=args.title,
             )
             dest = result.mp4_path or result.task_dir
+            if (
+                max_segments is None
+                and result.mp4_path
+                and jav_library_dir is not None
+            ):
+                code = extract_code_from_url(args.url)
+                if code:
+                    dest = move_mp4_to_jav_library(
+                        result.mp4_path,
+                        code,
+                        jav_library_dir,
+                    )
+                    append_downloaded_jav(code)
+                    print(f"[入库] {code} → {dest}")
             print(f"\n完成: {result.title}")
             print(f"文件: {dest}")
             return
@@ -890,6 +976,8 @@ def main() -> None:
                 keep_segments=args.keep_segments,
                 enable_web=not args.no_web,
                 web_port=args.web_port,
+                web_host=args.web_host,
+                jav_library_dir=jav_library_dir,
             )
             if args.shutdown:
                 request_system_shutdown()

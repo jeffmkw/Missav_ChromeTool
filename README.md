@@ -59,7 +59,7 @@ python download_missav.py --download-only
 ```
 
 - 默认最多同时下 2 个视频，每个视频 4 个分片线程
-- 默认保存到 `D:\downloads`（可在项目根 `.env` 设 `DOWNLOAD_DIR=...`，或用 `--output` 改）
+- 默认保存到项目内 `downloads/`（可在项目根 `.env` 设 `DOWNLOAD_DIR=...`，或用 `--output` 改）
 - 下完一个会马上合并 mp4，**需要 ffmpeg**；合并时下载槽可以接下一个
 - 默认开进度页，终端会打印地址，自己点开即可（一般是 `http://127.0.0.1:8777`）
 - 不想要网页：加 `--no-web`
@@ -99,7 +99,7 @@ flowchart LR
 | `--max-segments 5` | 只下前几片，测通流程用 |
 | `--no-web` | 关掉进度页 |
 | `--web-port 8777` | 改进度页端口 |
-| `--output D:\某目录` | 换保存目录（默认 `D:\downloads` 或 `.env`） |
+| `--output 某目录` | 换保存目录（默认项目内 `downloads/` 或 `.env`） |
 | `--check-list 路径` | 换 checklist JSON（默认 `check_list2.json`） |
 | `--keep-segments` | 合并后保留分片目录（默认删） |
 | `--url URL --uuid UUID` | 单条下载，跳过采集清单 |
@@ -112,8 +112,9 @@ flowchart LR
 | 东西 | 说明 |
 |------|------|
 | `chrome_extension/` | Chrome 扩展|
-| `check_list2.json` | 采集结果|
-| `.env` | 本机配置，如 `DOWNLOAD_DIR=D:\某目录`|
+| `check_list2.json` | 采集结果（本机文件，已 gitignore）|
+| `.env` | 本机配置（由 `.env.example` 生成，勿提交）|
+| `.env.example` | 配置模板（可提交）|
 | `missav.ws_cookies.txt` | Cookie |
 
 ---
