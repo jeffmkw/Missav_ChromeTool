@@ -38,6 +38,10 @@ NAS 宿主机下载（本机 collect + NAS 用 Python urllib 拉 surrit CDN）
    # 进程:   ps -ef | grep download_missav_nas | grep -v grep
    # 中断后续跑同一命令即可（downloading 分片可续）
 
+   批次结束后自动回查：失败任务以低并发（parallel=1, workers=5）重试
+   短间隔 5 轮（60s）+ 长间隔 5 轮（600s），仍失败写入
+   logs/download_failed_*.log 并保留临时分片供下次续传
+
    本机 --collect 更新 check_list2.json 后必须重启本脚本才会吃到新条目
    （启动时读一次清单，运行中不重扫；项目目录与本机共享，无需拷文件）:
    pgrep -af download_missav_nas || echo "未在跑"

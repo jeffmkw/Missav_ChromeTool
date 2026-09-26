@@ -42,7 +42,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
 from rich.progress import (
@@ -94,6 +96,16 @@ from missav_tab_check import (
 
 MAX_PARALLEL_TASKS = 4
 SEGMENT_WORKERS = 20
+
+# 批次结束后失败回查：低并发多轮重试，消化 probe/播放列表的瞬时网络抖动
+# 前 RETRY_SHORT_ROUNDS 轮短间隔，后 RETRY_LONG_ROUNDS 轮长间隔，仍失败写错误日志
+RETRY_SHORT_ROUNDS = 5
+RETRY_LONG_ROUNDS = 5
+RETRY_SHORT_WAIT_S = 60
+RETRY_LONG_WAIT_S = 600
+RETRY_PARALLEL = 1
+RETRY_WORKERS = 5
+FAILED_LOG_DIR = Path(__file__).resolve().parent / "logs"
 
 PHASE_LABELS = {
     "parse": "解析页面",
@@ -677,13 +689,96 @@ def run_download_only(
 
         persist_checklist()
 
+        # ---- 失败回查：低并发多轮重试（短间隔 ×N + 长间隔 ×N），再写错误日志 ----
+        err_by_url = {url.rstrip("/"): exc for url, exc in errors}
+        if max_segments is None:
+            total_rounds = RETRY_SHORT_ROUNDS + RETRY_LONG_ROUNDS
+            for round_idx in range(1, total_rounds + 1):
+                # failed：本轮下载/合并失败；ready：合并失败后退段重下
+                pending_entries = [
+                    e
+                    for e in (*download_entries, *merge_only_entries)
+                    if e.status in ("failed", "ready")
+                ]
+                if not pending_entries:
+                    break
+                print(
+                    f"\n[回查] 第 {round_idx}/{total_rounds} 轮低并发重试: "
+                    f"{len(pending_entries)} 个失败任务"
+                    f"（parallel={RETRY_PARALLEL}, workers={RETRY_WORKERS}）"
+                )
+                round_results, retry_errors = _run_download_merge_pipeline(
+                    download_items=[e.to_tab_item() for e in pending_entries],
+                    merge_only_items=[],
+                    output_dir=output_dir,
+                    max_segments=max_segments,
+                    parallel=RETRY_PARALLEL,
+                    workers=RETRY_WORKERS,
+                    keep_segments=keep_segments,
+                    on_download_start=on_download_start,
+                    on_segments_done=on_segments_done,
+                    on_success=on_success,
+                    on_failure=on_failure,
+                    store=store,
+                )
+                results.extend(round_results)
+                for url, exc in retry_errors:
+                    err_by_url[url.rstrip("/")] = exc
+                persist_checklist()
+                if not retry_errors:
+                    break
+                wait_s = (
+                    RETRY_SHORT_WAIT_S
+                    if round_idx <= RETRY_SHORT_ROUNDS
+                    else RETRY_LONG_WAIT_S
+                )
+                if round_idx < total_rounds:
+                    print(
+                        f"[回查] 仍失败 {len(retry_errors)} 个，"
+                        f"{wait_s} 秒后第 {round_idx + 1} 轮"
+                    )
+                    time.sleep(wait_s)
+            errors = [
+                (
+                    e.page_url,
+                    err_by_url.get(e.page_url.rstrip("/"), "未知错误"),
+                )
+                for e in (*download_entries, *merge_only_entries)
+                if e.status == "failed"
+            ]
+
         print(f"\n完成 {len(results)}/{total_n} 个任务")
         for r in results:
             dest = r.mp4_path or r.task_dir
             print(f"  OK {r.title}")
             print(f"    → {dest}")
-        for url, exc in errors:
-            print(f"  FAIL {_short_label(url)}: {exc}", file=sys.stderr)
+        if errors:
+            for url, exc in errors:
+                print(f"  FAIL {_short_label(url)}: {exc}", file=sys.stderr)
+            # 重试耗尽仍失败：写错误日志，便于人工排查
+            FAILED_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = (
+                FAILED_LOG_DIR / f"download_failed_{datetime.now():%Y%m%d_%H%M%S}.log"
+            )
+            log_lines = [
+                f"# {datetime.now():%Y-%m-%d %H:%M:%S} 下载失败 {len(errors)} 个任务",
+                "# 字段：page_url\terror",
+            ]
+            log_lines += [f"{url}\t{exc}" for url, exc in errors]
+            log_path.write_text(
+                "\n".join(log_lines) + "\n", encoding="utf-8"
+            )
+            print(f"  错误日志: {log_path}")
+
+        # 临时目录回查：报告残留（未完成任务保留供下次续传）
+        leftovers = sorted(
+            p.name for p in output_dir.glob("*.m3u8") if p.is_dir()
+        )
+        if leftovers:
+            print(
+                f"[回查] {output_dir} 残留 {len(leftovers)} 个临时目录"
+                "（未完成任务，保留供续传）"
+            )
     finally:
         if web is not None:
             web.stop()

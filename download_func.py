@@ -137,6 +137,7 @@ PhaseCallback = Callable[[str], None]
 CURL_BIN = "curl.exe" if sys.platform == "win32" else "curl"
 SEGMENT_MAX_TIME_S = 120
 SEGMENT_MAX_RETRIES = 3
+PLAYLIST_MAX_RETRIES = 3
 PROBE_MAX_TIME_S = 8
 DEFAULT_SEGMENT_WORKERS = 4
 HttpBackend = Literal["curl", "python"]
@@ -398,7 +399,10 @@ def _python_probe(url: str, referer: str) -> bool:
         if not head or _looks_like_html(head) or _is_cloudflare_bytes(head):
             return False
         return b"#EXTM3U" in head
-    except DownloadError:
+    # socket.timeout(TimeoutError/OSError) 会在 read 阶段穿透 urlopen 的
+    # URLError 封装，必须一并吞掉：probe 失败应返回 False 让上层换清晰度/UUID，
+    # 而不是把整个任务判死（瞬时网络抖动靠 run_download_only 的轮询重试消化）
+    except (DownloadError, OSError):
         return False
 
 
@@ -662,7 +666,24 @@ def download_hls(
     index_dir = task_dir / "index"
     index_dir.mkdir(parents=True, exist_ok=True)
 
-    playlist_bytes = curl_fetch(m3u8_url, referer)
+    # 拉播放列表：瞬时 read 超时退避重试（与分片下载一致），
+    # 分片全在盘上时这是合并前唯一的有网步骤，不能一超时就判死
+    playlist_bytes: bytes | None = None
+    last_exc: Exception | None = None
+    for attempt in range(1, PLAYLIST_MAX_RETRIES + 1):
+        try:
+            playlist_bytes = curl_fetch(m3u8_url, referer)
+            break
+        except DownloadError:
+            raise
+        except OSError as exc:  # socket.timeout 等瞬时网络错误
+            last_exc = exc
+            if attempt < PLAYLIST_MAX_RETRIES:
+                time.sleep(min(attempt * 2.0, 5.0))
+    if playlist_bytes is None:
+        raise DownloadError(
+            f"m3u8 播放列表获取失败({PLAYLIST_MAX_RETRIES} 次): {last_exc}"
+        )
     segments = parse_m3u8(playlist_bytes.decode("utf-8", errors="replace"))
     if not segments:
         raise DownloadError("m3u8 播放列表为空")
