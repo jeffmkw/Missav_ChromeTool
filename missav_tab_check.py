@@ -11,9 +11,13 @@ Chrome Tab 检查模块（扩展自动上报 URL + UUID）
   1. 采集（扩展嗅探 surrit …/{uuid}/{任意清晰度}/video.m3u8，点播放即上报）:
      python download_missav.py --collect
      在 Chrome 逐个点播放；终端按 Enter 结束采集
+     封面由扩展下载后 POST /cover，保存到项目 covers/{番号}.jpg
+     资料齐全时写入 pending/{番号}/（movie.nfo、poster.jpg、fanart.jpg、metadata.json、job.json）
+     缺番号、标题、女优、类型、发行日期、简介、发行商、封面时标为 incomplete，不进入下载
 
   2. 下载（独立，有空再跑）:
      python download_missav.py --download-only
+     只处理 pending 目录已定稿的条目；合并后补时长，整夹搬入片库
 """
 
 from __future__ import annotations
@@ -24,10 +28,17 @@ import re
 import shutil
 import tempfile
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
+
+from missav_metadata import (
+    MetadataPackageError,
+    missing_collect_fields,
+    prepare_pending_dir,
+    safe_path_component,
+)
 
 CODE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^FC2-PPV-\d{6,8}", re.I),
@@ -82,10 +93,17 @@ EXTENSION_PORT = 8766
 EXTENSION_DIR = Path(__file__).resolve().parent / "chrome_extension"
 CHECK_LIST2_FILE = Path(__file__).resolve().parent / "check_list2.txt"
 CHECK_LIST2_JSON = Path(__file__).resolve().parent / "check_list2.json"
+COVERS_DIR = Path(__file__).resolve().parent / "covers"
+PENDING_ROOT = Path(__file__).resolve().parent / "pending"
+_COVER_CODE_RE = re.compile(r"^[A-Z0-9][A-Z0-9-]{1,40}$")
+_MAX_COVER_BYTES = 8 * 1024 * 1024
 CHECK_LIST1_FILE = Path(__file__).resolve().parent / "check_list1.txt"
 CHECK_LIST1_JSON = Path(__file__).resolve().parent / "check_list1.json"
 DOWNLOADED_JAV_FILE = Path(__file__).resolve().parent / "downloaded_jav.txt"
 UNKNOWN_JAV_FOLDER = "_UNKNOWN"
+# 2026-10-21: 入库流程对接 javsp 刮削，片库内不再按番号前缀分文件夹。
+# 识别出番号的成片统一平铺到 _incoming/，由 javsp 刮削后移入 JAV/{女优}/[番号]/。
+INCOMING_JAV_FOLDER = "_incoming"
 # 与 organize_jav_files 一致：字母前缀 + (-|_) + 数字
 CODE_PREFIX_RE = re.compile(r"([A-Za-z]+)[-_]\d+")
 VIDEO_EXTENSIONS = frozenset(
@@ -99,7 +117,15 @@ _LEGACY_CHECK_LIST_FILE = Path(__file__).resolve().parent / "check_list.txt"
 _LEGACY_CHECK_LIST_JSON = Path(__file__).resolve().parent / "check_list.json"
 
 CHECKLIST2_STATUSES = frozenset(
-    {"pending", "ready", "downloading", "download_done", "failed", "downloaded"}
+    {
+        "pending",
+        "incomplete",
+        "ready",
+        "downloading",
+        "download_done",
+        "failed",
+        "downloaded",
+    }
 )
 # 采集时勿覆盖，避免把进行中的任务重置回 ready
 CHECKLIST2_PROGRESS_STATUSES = frozenset(
@@ -211,11 +237,22 @@ def sync_downloaded_jav_from_dir(
 
 
 def extract_code_prefix(code: str) -> str:
-    """番号字母前缀，用于片库子目录（如 SSNI-126 → SSNI）。"""
+    """番号字母前缀（如 SSNI-126 → SSNI）。仅保留作展示/日志用途。
+
+    2026-10-21 起入库不再按前缀建子目录，见 move_mp4_to_jav_library。
+    """
     match = CODE_PREFIX_RE.search(code.strip())
     if match:
         return match.group(1).upper()
     return UNKNOWN_JAV_FOLDER
+
+
+def pending_dir_for_code(code: str) -> Path:
+    """待下载目录：项目 pending/{番号}/。采集写元数据，下载再放入成片并搬走。"""
+    cleaned = safe_path_component(str(code or "").strip().upper(), max_length=80)
+    if cleaned in {"", "_unnamed"}:
+        raise TabCheckError(f"无法为番号创建待下载目录: {code!r}")
+    return PENDING_ROOT / cleaned
 
 
 def move_mp4_to_jav_library(
@@ -224,7 +261,10 @@ def move_mp4_to_jav_library(
     jav_root: Path | str,
 ) -> Path:
     """
-    将合成后的 mp4 挪到片库 {jav_root}/{PREFIX}/。
+    将合成后的 mp4 挪到片库 {jav_root}/_incoming/（2026-10-21 起不再按前缀分目录）。
+
+    入库后的刮削归 javsp 负责：识别番号 → JAV/{女优}/[番号] 标题/，
+    识别不出番号 → javsp 会自动移到 {jav_root}/_UNKNOWN/。
     目标同名已存在则先删除再移动。
     """
     src = Path(mp4_path)
@@ -233,8 +273,7 @@ def move_mp4_to_jav_library(
 
     root = Path(jav_root)
     root.mkdir(parents=True, exist_ok=True)
-    prefix = extract_code_prefix(code)
-    dest_dir = root / prefix
+    dest_dir = root / INCOMING_JAV_FOLDER
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / src.name
 
@@ -301,6 +340,7 @@ class TabItem:
     uuids: list[str] | None = None
     m3u8_url: str | None = None
     quality: str | None = None
+    metadata: dict = field(default_factory=dict)
 
     @property
     def uuid_candidates(self) -> list[str]:
@@ -333,6 +373,9 @@ class TabItem:
             uuids = [video_uuid]
         m3u8_url = str(data.get("m3u8_url", "")).strip() or None
         quality = str(data.get("quality", "")).strip() or None
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
         return cls(
             page_url=page_url,
             title=title,
@@ -340,6 +383,7 @@ class TabItem:
             uuids=uuids,
             m3u8_url=m3u8_url,
             quality=quality,
+            metadata=metadata,
         )
 
 
@@ -368,6 +412,8 @@ class CheckList2Entry:
     m3u8_url: str | None = None
     quality: str | None = None
     status: str = "pending"
+    metadata: dict = field(default_factory=dict)
+    pending_dir: str = ""
 
     def to_tab_item(self) -> TabItem:
         return TabItem(
@@ -377,6 +423,7 @@ class CheckList2Entry:
             uuids=self.uuids,
             m3u8_url=self.m3u8_url,
             quality=self.quality,
+            metadata=self.metadata,
         )
 
     @classmethod
@@ -395,6 +442,9 @@ class CheckList2Entry:
         if status not in CHECKLIST2_STATUSES:
             status = "pending"
         code = data.get("code")
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
         return cls(
             page_url=page_url,
             code=str(code).upper() if code else extract_code_from_url(page_url),
@@ -404,6 +454,8 @@ class CheckList2Entry:
             m3u8_url=str(data.get("m3u8_url", "")).strip() or None,
             quality=str(data.get("quality", "")).strip() or None,
             status=status,
+            metadata=metadata,
+            pending_dir=str(data.get("pending_dir") or "").strip(),
         )
 
 
@@ -634,6 +686,7 @@ def write_check_items(items: list[TabItem], txt_file: Path | str = CHECK_LIST_FI
                 m3u8_url=item.m3u8_url,
                 quality=item.quality,
                 status="ready" if item.video_uuid else "pending",
+                metadata=item.metadata or {},
             )
             for item in items
         ],
@@ -661,6 +714,67 @@ def _short_text(text: str, width: int = 48) -> str:
     return text[: width - 1] + "…"
 
 
+def _snapshot_from_report(
+    item: TabItem,
+    prev: CheckList2Entry | None,
+    code: str | None,
+) -> tuple[dict, str, str]:
+    """返回 (metadata, pending_dir, status)。
+
+    资料齐全才写入 pending 并标 ready。空上报不覆盖已有定稿。
+    进行中的任务不会进到这里。
+    """
+    new_meta = dict(item.metadata or {})
+    if code and not str(new_meta.get("code") or "").strip():
+        new_meta["code"] = code
+    if item.page_url and not str(new_meta.get("source_url") or "").strip():
+        new_meta["source_url"] = item.page_url
+    if item.title and not str(new_meta.get("title") or "").strip():
+        new_meta["title"] = item.title
+
+    prev_complete = bool(
+        prev
+        and prev.pending_dir
+        and not missing_collect_fields(prev.metadata, page_url=prev.page_url, code=prev.code or "")
+    )
+    if not item.metadata or (prev_complete and missing_collect_fields(
+        new_meta, page_url=item.page_url, page_title=item.title, code=code or ""
+    )):
+        if prev_complete and prev is not None:
+            return dict(prev.metadata), prev.pending_dir, "ready"
+        kept = dict(prev.metadata) if prev and not item.metadata else new_meta
+        return kept, "", "incomplete"
+
+    missing = missing_collect_fields(
+        new_meta, page_url=item.page_url, page_title=item.title, code=code or ""
+    )
+    if missing:
+        return new_meta, "", "incomplete"
+
+    try:
+        pending = pending_dir_for_code(code or new_meta.get("code") or "")
+    except TabCheckError:
+        return new_meta, "", "incomplete"
+    try:
+        meta = prepare_pending_dir(
+            pending,
+            new_meta,
+            {
+                "page_url": item.page_url,
+                "video_uuid": item.video_uuid,
+                "uuids": item.uuids or [],
+                "m3u8_url": item.m3u8_url or "",
+                "quality": item.quality or "",
+            },
+            page_url=item.page_url,
+            page_title=item.title,
+        )
+    except MetadataPackageError:
+        raise
+    rel = pending.resolve().relative_to(PENDING_ROOT.parent.resolve()).as_posix()
+    return meta, rel, "ready"
+
+
 def _merge_extension_items(
     tab_items: list[TabItem],
     *,
@@ -669,7 +783,11 @@ def _merge_extension_items(
     downloaded: set[str] | None = None,
     report_seq: list[int] | None = None,
 ) -> tuple[int, list[str]]:
-    """把扩展上报条目合并进 by_url 并落盘；返回 (新增/更新数, 跳过 URL 列表)。"""
+    """把扩展上报条目合并进 by_url 并落盘；返回 (新增/更新数, 跳过 URL 列表)。
+
+    资料齐全时写入 pending/{番号}/ 并标 ready。缺字段标 incomplete，不进入下载。
+    下载中的条目保持原样。空上报不擦掉已有定稿。
+    """
     skipped: list[str] = []
     added_or_updated = 0
     status_touched = False
@@ -685,7 +803,10 @@ def _merge_extension_items(
         if not item.video_uuid:
             continue
         key = item.page_url.rstrip("/")
-        code = extract_code_from_url(item.page_url)
+        raw_code = ""
+        if isinstance(item.metadata, dict):
+            raw_code = str(item.metadata.get("code") or "").strip().upper()
+        code = raw_code or extract_code_from_url(item.page_url)
         prev = by_url.get(key)
         code_label = code or (prev.code if prev else None) or "?"
         title_hint = _short_text(item.title or item.page_url)
@@ -695,13 +816,46 @@ def _merge_extension_items(
             skipped.append(item.page_url)
             seq = _next_seq()
             prefix = f"#{seq} " if seq else ""
-            print(
-                f"  {prefix}[本地已有] {code_label}  跳过  | {title_hint}",
-                flush=True,
+            try:
+                metadata, pending_dir, snap_status = _snapshot_from_report(item, prev, code)
+            except MetadataPackageError as exc:
+                print(
+                    f"  {prefix}[本地已有] {code_label}  资料未刷新：{exc}  | {title_hint}",
+                    flush=True,
+                )
+                if prev and prev.status != "downloaded":
+                    prev.status = "downloaded"
+                    status_touched = True
+                continue
+            entry = CheckList2Entry(
+                page_url=item.page_url,
+                code=code or (prev.code if prev else None),
+                title=str(metadata.get("title") or item.title or item.page_url),
+                video_uuid=(prev.video_uuid if prev and prev.video_uuid else item.video_uuid),
+                uuids=(prev.uuids if prev and prev.uuids else item.uuids),
+                m3u8_url=(prev.m3u8_url if prev and prev.m3u8_url else item.m3u8_url),
+                quality=(prev.quality if prev and prev.quality else item.quality),
+                status="downloaded",
+                metadata=metadata,
+                pending_dir=pending_dir,
             )
-            if prev and prev.status != "downloaded":
-                prev.status = "downloaded"
-                status_touched = True
+            by_url[key] = entry
+            status_touched = True
+            where = pending_dir or "未写入"
+            if snap_status == "ready":
+                print(
+                    f"  {prefix}[本地已有] {code_label}  不重新下载，资料已写入 {where}  | {title_hint}",
+                    flush=True,
+                )
+            else:
+                missing = missing_collect_fields(
+                    metadata, page_url=item.page_url, page_title=item.title, code=code or ""
+                )
+                detail = "、".join(missing) if missing else "资料不全"
+                print(
+                    f"  {prefix}[本地已有] {code_label}  不重新下载，资料仍缺 {detail}  | {title_hint}",
+                    flush=True,
+                )
             continue
 
         if prev and prev.status in CHECKLIST2_PROGRESS_STATUSES:
@@ -713,10 +867,10 @@ def _merge_extension_items(
                 flush=True,
             )
             continue
-        # 同 URL 已有更高清晰度则保留
+
+        keep_media = False
         if (
             prev
-            and prev.status == "ready"
             and prev.video_uuid == item.video_uuid
             and prev.m3u8_url
             and item.m3u8_url
@@ -726,6 +880,8 @@ def _merge_extension_items(
             prev_q = quality_rank(prev.quality)
             new_q = quality_rank(item.quality)
             if prev_q and new_q and prev_q >= new_q:
+                keep_media = True
+                skipped.append(item.page_url)
                 seq = _next_seq()
                 prefix = f"#{seq} " if seq else ""
                 print(
@@ -733,33 +889,68 @@ def _merge_extension_items(
                     f"  | {title_hint}",
                     flush=True,
                 )
-                continue
 
+        try:
+            metadata, pending_dir, status = _snapshot_from_report(item, prev, code)
+        except MetadataPackageError as exc:
+            metadata = dict(item.metadata or {})
+            pending_dir = ""
+            status = "incomplete"
+            seq = _next_seq()
+            prefix = f"#{seq} " if seq else ""
+            print(
+                f"  {prefix}[资料未定稿] {code_label}  {exc}  | {title_hint}",
+                flush=True,
+            )
+        else:
+            if status == "incomplete":
+                missing = missing_collect_fields(
+                    metadata,
+                    page_url=item.page_url,
+                    page_title=item.title,
+                    code=code or "",
+                )
+                seq = _next_seq()
+                prefix = f"#{seq} " if seq else ""
+                detail = "、".join(missing) if missing else "资料不全"
+                print(
+                    f"  {prefix}[资料不全] {code_label}  缺 {detail}  | {title_hint}",
+                    flush=True,
+                )
+
+        normalized_title = str(metadata.get("title") or item.title or "").strip()
         entry = CheckList2Entry(
             page_url=item.page_url,
             code=code or (prev.code if prev else None),
-            title=item.title,
-            video_uuid=item.video_uuid,
-            uuids=item.uuids,
-            m3u8_url=item.m3u8_url,
-            quality=item.quality,
-            status="ready",
+            title=normalized_title or item.page_url,
+            video_uuid=(prev.video_uuid if keep_media and prev else item.video_uuid),
+            uuids=(prev.uuids if keep_media and prev else item.uuids),
+            m3u8_url=(prev.m3u8_url if keep_media and prev else item.m3u8_url),
+            quality=(prev.quality if keep_media and prev else item.quality),
+            status=status,
+            metadata=metadata,
+            pending_dir=pending_dir,
         )
         by_url[key] = entry
         added_or_updated += 1
-        action = "更新" if prev else "新增"
-        seq = _next_seq()
-        prefix = f"#{seq} " if seq else ""
-        m3u8_hint = quality_hint if item.m3u8_url else "待探测"
-        print(
-            f"  {prefix}[{action}] {code_label}  → ready  ({m3u8_hint})"
-            f"  | {title_hint}",
-            flush=True,
-        )
+        if not keep_media:
+            action = "更新" if prev else "新增"
+            seq = _next_seq()
+            prefix = f"#{seq} " if seq else ""
+            m3u8_hint = quality_hint if item.m3u8_url else "待探测"
+            print(
+                f"  {prefix}[{action}] {code_label}  → {status}  ({m3u8_hint})"
+                f"  | {title_hint}",
+                flush=True,
+            )
 
     if added_or_updated or status_touched:
         kept_items = list(by_url.values())
-        write_check_list2(kept_items, json_file=output_path)
+        write_check_list2(
+            kept_items,
+            json_file=output_path,
+            txt_file=output_path.with_suffix('.txt'),
+        )
         list1_entries = [
             List1Entry(page_url=e.page_url, code=e.code)
             for e in kept_items
@@ -768,6 +959,45 @@ def _merge_extension_items(
         write_check_list1(list1_entries)
 
     return added_or_updated, skipped
+
+
+def _cover_suffix(data: bytes) -> str | None:
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return ".gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def save_cover_bytes(code: str, data: bytes) -> str:
+    """把浏览器已下载的封面写入 covers/{番号}.ext，返回相对路径。"""
+    normalized = str(code or "").strip().upper()
+    if not _COVER_CODE_RE.match(normalized):
+        raise TabCheckError(f"封面番号不合法: {code!r}")
+    if not data or len(data) > _MAX_COVER_BYTES:
+        raise TabCheckError(f"封面大小无效: {len(data) if data else 0}")
+    suffix = _cover_suffix(data)
+    if suffix is None:
+        raise TabCheckError("封面不是 jpeg/png/gif/webp")
+
+    COVERS_DIR.mkdir(parents=True, exist_ok=True)
+    final = COVERS_DIR / f"{normalized}{suffix}"
+    fd, tmp_name = tempfile.mkstemp(dir=str(COVERS_DIR), prefix=".cover_", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(tmp_name, final)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return final.relative_to(COVERS_DIR.parent).as_posix()
 
 
 def collect_from_extension(
@@ -804,7 +1034,11 @@ def collect_from_extension(
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             nonlocal total_updated, session_ready
-            if self.path not in ("/export", "/tabs"):
+            path = urlparse(self.path).path
+            if path == "/cover":
+                self._save_cover()
+                return
+            if path not in ("/export", "/tabs"):
                 self.send_error(404)
                 return
             length = int(self.headers.get("Content-Length", 0))
@@ -846,6 +1080,36 @@ def collect_from_extension(
                     "ready": session_ready,
                 }
             ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _save_cover(self) -> None:
+            query = urlparse(self.path).query
+            code = ""
+            for part in query.split("&"):
+                if part.startswith("code="):
+                    code = unquote(part[5:])
+                    break
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0 or length > _MAX_COVER_BYTES:
+                self.send_error(400, "封面大小无效")
+                return
+            data = self.rfile.read(length)
+            try:
+                rel = save_cover_bytes(code, data)
+            except TabCheckError as exc:
+                payload = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            print(f"  [封面] {code.strip().upper()} → {rel}", flush=True)
+            payload = json.dumps({"ok": True, "cover_file": rel}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -905,10 +1169,12 @@ def collect_from_extension(
     server.shutdown()
     kept_items = list(by_url.values())
     ready = sum(1 for e in kept_items if e.status == "ready")
+    incomplete = sum(1 for e in kept_items if e.status == "incomplete")
     print(
         f"\n清单共 {len(kept_items)} 条 → {output_path}"
-        f"（本次新增/更新 {total_updated}，ready={ready}）"
+        f"（本次新增/更新 {total_updated}，ready={ready}，incomplete={incomplete}）"
     )
+    print(f"待下载目录: {PENDING_ROOT}")
     if all_skipped:
         print(f"去重跳过 {len(all_skipped)} 条")
     if total_updated == 0 and session_ready == 0:
