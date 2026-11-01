@@ -73,6 +73,22 @@ flowchart TD
   down -.->|槽位空出| next
 ```
 
+## 第三步：采集时定稿，下载时入库
+
+采集时扩展读取页面详情。番号、标题、女优、类型、发行日期、简介、发行商、封面都有时，写入 `pending/{番号}/`：
+
+- `movie.nfo`、`poster.jpg`、`fanart.jpg`、`metadata.json`、`job.json`
+- 横版封面按宽度 × 0.528 裁右侧作为 `poster.jpg`，完整图作为 `fanart.jpg`
+- 清单状态为 `ready`
+
+缺任何一项则状态为 `incomplete`，不会下载。导演、男优、标签、日文标题有则写入。扩展更新后要在 `chrome://extensions` 点「重新加载」。
+
+下载只拉取并合并视频，用成片时长补进 NFO，再把 `pending/{番号}/` 整夹搬到 `{JAV_LIBRARY_DIR}/JAV/{女优}/[番号] 标题/`。不再使用 javsp，也不再丢进 `_incoming`。
+
+安装元数据依赖：`pip install -r requirements.txt`（已含 `Pillow>=10.0`）。
+
+---
+
 ### 任务状态（中断了也不怕）
 
 ```mermaid
