@@ -26,7 +26,10 @@
    python download_missav.py --download-only --workers 20 --parallel 4
    python download_missav.py --download-only --shutdown
    → 路径见 .env；开始前扫描片库，已有番号跳过
-   → 全量合成成功后挪到 {JAV_LIBRARY_DIR}/{PREFIX}/
+   → 只下载清单里 ready、且 pending/{番号}/ 已有 NFO 和封面的条目
+   → 合并后把 mp4 放进该目录，补上时长，整夹搬到
+     {JAV_LIBRARY_DIR}/JAV/{女优}/[番号] 标题/
+   → 资料不全的 incomplete 不会下载
    → --max-segments 测试：不入库、不登记
    → 默认开启进度页（http://127.0.0.1:8777）；--no-web 可关闭
 
@@ -75,6 +78,11 @@ from download_progress_web import (
     ProgressStore,
     ProgressWebServer,
 )
+from missav_metadata import (
+    MetadataPackageError,
+    PackageResult,
+    shelve_pending_dir,
+)
 from missav_tab_check import (
     CHECK_LIST2_JSON,
     DOWNLOADED_JAV_FILE,
@@ -88,8 +96,8 @@ from missav_tab_check import (
     is_code_downloaded,
     load_check_list2,
     load_downloaded_jav,
-    move_mp4_to_jav_library,
     normalize_code,
+    pending_dir_for_code,
     save_check_list2,
     sync_downloaded_jav_from_dir,
 )
@@ -448,9 +456,11 @@ def _run_download_merge_pipeline(
                     item = merge_futs[fut]
                     try:
                         result = fut.result()
-                        results.append(result)
                         if on_success:
                             on_success(item, result)
+                            results.append(result)
+                        else:
+                            results.append(result)
                     except Exception as exc:
                         mark_fail(item, exc)
 
@@ -506,6 +516,33 @@ def run_parallel(
     return results
 
 
+def resolve_pending_dir(pending_dir: str) -> Path | None:
+    """解析清单里的 pending_dir。相对路径相对项目根。目录里没有 movie.nfo 则视为未定稿。"""
+    raw = str(pending_dir or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    if not (path / "movie.nfo").is_file() or not (path / "metadata.json").is_file():
+        return None
+    return path
+
+
+def _package_or_move_to_library(
+    mp4_path: Path | str,
+    entry: CheckList2Entry,
+    jav_library_dir: Path | str,
+) -> tuple[Path, PackageResult]:
+    """把成片放进采集时写好的待下载目录，再整夹搬进片库。"""
+    pending = resolve_pending_dir(entry.pending_dir)
+    if pending is None:
+        code = entry.code or extract_code_from_url(entry.page_url) or entry.page_url
+        raise MetadataPackageError(f"缺少待下载目录，请重新采集: {code}")
+    package_result = shelve_pending_dir(pending, mp4_path, jav_library_dir)
+    return package_result.video_path, package_result
+
+
 def run_download_only(
     entries: list[CheckList2Entry],
     output_dir: Path,
@@ -523,6 +560,7 @@ def run_download_only(
     download_entries: list[CheckList2Entry] = []
     demoted = 0
     skipped_library = 0
+    skipped_incomplete = 0
 
     if jav_library_dir is not None:
         if not jav_library_dir.is_dir():
@@ -549,6 +587,10 @@ def run_download_only(
                 entry.status = "downloaded"
                 skipped_library += 1
             continue
+        if resolve_pending_dir(entry.pending_dir) is None:
+            entry.status = "incomplete"
+            skipped_incomplete += 1
+            continue
         if entry.status == "download_done":
             title = entry.title or entry.page_url
             task_dir = segments_task_dir(output_dir, title)
@@ -569,18 +611,20 @@ def run_download_only(
     _order = {"downloading": 0, "ready": 1, "failed": 2}
     download_entries.sort(key=lambda e: _order.get(e.status, 3))
 
-    if skipped_library or demoted:
+    if skipped_library or demoted or skipped_incomplete:
         save_check_list2(entries)
     if skipped_library:
         print(f"片库已有，跳过 {skipped_library} 条（已标为 downloaded）")
+    if skipped_incomplete:
+        print(f"资料未定稿，跳过 {skipped_incomplete} 条（已标为 incomplete，请重新 --collect）")
     if demoted:
         print(f"有 {demoted} 条 download_done 缺少分片，已退回 ready 重新下载")
 
     if not merge_only_entries and not download_entries:
         raise DownloadError(
             "checklist2 中没有可处理条目"
-            "（需要 ready / downloading / download_done / failed 且含 video_uuid）\n"
-            "请先运行 --collect，在 Chrome 逐个点播放（扩展自动上报）"
+            "（需要 ready / downloading / download_done / failed，且 pending 目录已有 NFO）\n"
+            "请先运行 --collect，在 Chrome 打开影片页并点播放"
         )
 
     all_by_url = {e.page_url.rstrip("/"): e for e in entries}
@@ -641,14 +685,33 @@ def run_download_only(
             print(f"  [测试] 限分片，未入库未登记: {result.mp4_path or result.task_dir}")
             return
 
+        package_result = None
         if result.mp4_path and code and jav_library_dir is not None:
-            final_path = move_mp4_to_jav_library(
-                result.mp4_path,
-                code,
-                jav_library_dir,
-            )
-            result.mp4_path = final_path
-            print(f"  [入库] {code} → {final_path}")
+            try:
+                final_path, package_result = _package_or_move_to_library(
+                    result.mp4_path,
+                    entry,
+                    jav_library_dir,
+                )
+                result.mp4_path = final_path
+                if package_result is not None:
+                    print(
+                        f"  [入库] {code} → {final_path}"
+                        f" (scrape_needed={package_result.scrape_needed}"
+                        f" errors={package_result.errors})"
+                    )
+                    if package_result.scrape_needed:
+                        print(
+                            f"  [提示] {code} 元数据不完整，建议二次刮削: {', '.join(package_result.errors)}"
+                        )
+                else:
+                    print(f"  [入库] {code} → {final_path}")
+            except Exception as exc:
+                # 入库异常：先标 failed 并 persist，再抛出，避免 on_failure
+                # 把 download_done 当合并失败删除分片；不覆盖已有文件
+                entry.status = "failed"
+                persist_checklist()
+                raise
 
         entry.status = "downloaded"
         if code:
@@ -983,7 +1046,7 @@ def main() -> None:
     parser.add_argument(
         "--no-shelve",
         action="store_true",
-        help="下载完成后不自动入库片库（默认会挪到 JAV_LIBRARY_DIR/{PREFIX}/）",
+        help="下载完成后不搬入片库（默认把 pending 目录整夹搬入 JAV_LIBRARY_DIR）",
     )
     args = parser.parse_args()
 
@@ -1023,7 +1086,11 @@ def main() -> None:
                 output_json=check_list_path,
             )
             ready = sum(1 for item in result.items if item.status == "ready")
-            print(f"可下载（ready）: {ready} 条。有空后运行: --download-only")
+            incomplete = sum(1 for item in result.items if item.status == "incomplete")
+            print(
+                f"可下载（ready）: {ready} 条；资料不全（incomplete）: {incomplete} 条。"
+                "有空后运行: --download-only"
+            )
             return
 
         if args.url:
@@ -1043,14 +1110,14 @@ def main() -> None:
                 and jav_library_dir is not None
             ):
                 code = extract_code_from_url(args.url)
-                if code:
-                    dest = move_mp4_to_jav_library(
-                        result.mp4_path,
-                        code,
-                        jav_library_dir,
-                    )
+                pending = pending_dir_for_code(code) if code else None
+                if code and pending is not None and resolve_pending_dir(str(pending)) is not None:
+                    shelved = shelve_pending_dir(pending, result.mp4_path, jav_library_dir)
+                    dest = shelved.video_path
                     append_downloaded_jav(code)
                     print(f"[入库] {code} → {dest}")
+                else:
+                    print(f"未入库（没有待下载目录）: {result.mp4_path}")
             print(f"\n完成: {result.title}")
             print(f"文件: {dest}")
             return
@@ -1085,7 +1152,11 @@ def main() -> None:
             output_json=check_list_path,
         )
         ready = sum(1 for item in result.items if item.status == "ready")
-        print(f"可下载（ready）: {ready} 条。有空后运行: --download-only")
+        incomplete = sum(1 for item in result.items if item.status == "incomplete")
+        print(
+            f"可下载（ready）: {ready} 条；资料不全（incomplete）: {incomplete} 条。"
+            "有空后运行: --download-only"
+        )
 
     except (DownloadError, TabCheckError) as exc:
         print(f"错误: {exc}", file=sys.stderr)
