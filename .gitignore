@@ -30,6 +30,8 @@ out_test2/
 _probe_tmp/
 nas_tmp/
 downloads/
+covers/
+pending/
 *.json.tmp
 *.txt.tmp
 
