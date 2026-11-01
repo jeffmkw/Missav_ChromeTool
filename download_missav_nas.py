@@ -23,7 +23,7 @@ NAS 宿主机下载（本机 collect + NAS 用 Python urllib 拉 surrit CDN）
    # 需已有 ffmpeg（合并 mp4）
 
 2. .env 必填（见 .env.example）:
-   NAS_DOWNLOAD_DIR=/path/to/nas_tmp
+   NAS_DOWNLOAD_DIR=/path/to/download_cache
    NAS_JAV_LIBRARY_DIR=/path/to/library
 
 3. 清单下载（推荐：后台持续执行，断 SSH 不停）:
@@ -78,8 +78,9 @@ from download_func import (
     get_http_backend,
     set_http_backend,
 )
-from download_missav import run_download_only, run_single_url
+from download_missav import resolve_pending_dir, run_download_only, run_single_url
 from download_progress_web import DEFAULT_WEB_PORT
+from missav_metadata import shelve_pending_dir
 from missav_tab_check import (
     CHECK_LIST2_JSON,
     DOWNLOADED_JAV_FILE,
@@ -87,7 +88,7 @@ from missav_tab_check import (
     append_downloaded_jav,
     extract_code_from_url,
     load_check_list2,
-    move_mp4_to_jav_library,
+    pending_dir_for_code,
     sync_downloaded_jav_from_dir,
 )
 
@@ -148,7 +149,9 @@ def main() -> None:
         const="",
         default=None,
         metavar="DIR",
-        help="扫描片库写入 downloaded_jav.txt（默认 NAS_JAV_LIBRARY_DIR）",
+        help="扫描片库写入 downloaded_jav.txt（默认 NAS_JAV_LIBRARY_DIR）。"
+        "刮削入库后建议指向刮削产出目录（如 NAS_JAV_LIBRARY_DIR/JAV），"
+        "其影片文件名为番号（basename_pattern={num}），可直接抽取去重",
     )
     parser.add_argument(
         "--http-backend",
@@ -222,13 +225,13 @@ def main() -> None:
             code = extract_code_from_url(args.url)
             if not code:
                 raise DownloadError(f"无法从 URL 抽取番号，未入库: {args.url}")
-            shelved = move_mp4_to_jav_library(
-                result.mp4_path,
-                code,
-                jav_library_dir,
-            )
-            append_downloaded_jav(code)
-            print(f"已入库: {shelved}")
+            pending = pending_dir_for_code(code)
+            if resolve_pending_dir(str(pending)) is None:
+                print(f"未入库（没有待下载目录）: {result.mp4_path}")
+            else:
+                shelved = shelve_pending_dir(pending, result.mp4_path, jav_library_dir)
+                append_downloaded_jav(code)
+                print(f"已入库: {shelved.video_path}")
     except (DownloadError, TabCheckError) as exc:
         print(f"错误: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
